@@ -7,42 +7,90 @@ import copy
 import dataclasses
 import json
 import os
+import re
+import time
 import typing
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from functools import cached_property
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional, Tuple, Union
+from urllib.parse import urlparse
 from uuid import uuid4
 
 import eql
+import marshmallow
 from semver import Version
 from marko.block import Document as MarkoDocument
 from marko.ext.gfm import gfm
-from marshmallow import ValidationError, validates_schema
+from marshmallow import ValidationError, pre_load, validates_schema
 
 import kql
-from kql.ast import FieldComparison
 
 from . import beats, ecs, endgame, utils
-from .integrations import (find_least_compatible_version,
-                           load_integrations_manifests)
-from .misc import load_current_package_version
+from .config import load_current_package_version, parse_rules_config
+from .integrations import (find_least_compatible_version, get_integration_schema_fields,
+                           load_integrations_manifests, load_integrations_schemas,
+                           parse_datasets)
 from .mixins import MarshmallowDataclassMixin, StackCompatMixin
 from .rule_formatter import nested_normalize, toml_write
 from .schemas import (SCHEMA_DIR, definitions, downgrade,
-                      get_min_supported_stack_version, get_stack_schemas)
+                      get_min_supported_stack_version, get_stack_schemas,
+                      strip_non_public_fields)
 from .schemas.stack_compat import get_restricted_fields
-from .utils import cached, convert_time_span, PatchedTemplate
+from .utils import PatchedTemplate, cached, convert_time_span, get_nested_value, set_nested_value
+
 
 _META_SCHEMA_REQ_DEFAULTS = {}
 MIN_FLEET_PACKAGE_VERSION = '7.13.0'
+TIME_NOW = time.strftime('%Y/%m/%d')
+RULES_CONFIG = parse_rules_config()
+DEFAULT_PREBUILT_RULES_DIRS = RULES_CONFIG.rule_dirs
+DEFAULT_PREBUILT_BBR_DIRS = RULES_CONFIG.bbr_rules_dirs
+BYPASS_VERSION_LOCK = RULES_CONFIG.bypass_version_lock
+
 
 BUILD_FIELD_VERSIONS = {
     "related_integrations": (Version.parse('8.3.0'), None),
     "required_fields": (Version.parse('8.3.0'), None),
     "setup": (Version.parse('8.3.0'), None)
 }
+
+
+@dataclass
+class DictRule:
+    """Simple object wrapper for raw rule dicts."""
+
+    contents: dict
+    path: Optional[Path] = None
+
+    @property
+    def metadata(self) -> dict:
+        """Metadata portion of TOML file rule."""
+        return self.contents.get('metadata', {})
+
+    @property
+    def data(self) -> dict:
+        """Rule portion of TOML file rule."""
+        return self.contents.get('data') or self.contents
+
+    @property
+    def id(self) -> str:
+        """Get the rule ID."""
+        return self.data['rule_id']
+
+    @property
+    def name(self) -> str:
+        """Get the rule name."""
+        return self.data['name']
+
+    def __hash__(self) -> int:
+        """Get the hash of the rule."""
+        return hash(self.id + self.name)
+
+    def __repr__(self) -> str:
+        """Get a string representation of the rule."""
+        return f"Rule({self.name} {self.id})"
 
 
 @dataclass(frozen=True)
@@ -90,34 +138,30 @@ class RuleTransform(MarshmallowDataclassMixin):
         ecs_mapping: Optional[Dict[str, Dict[Literal['field', 'value'], str]]]
 
     @dataclass(frozen=True)
-    class Insight:
+    class Investigate:
         @dataclass(frozen=True)
         class Provider:
+            excluded: bool
             field: str
+            queryType: definitions.InvestigateProviderQueryType
             value: str
-            type: str
+            valueType: definitions.InvestigateProviderValueType
 
         label: str
+        description: Optional[str]
         providers: List[List[Provider]]
+        relativeFrom: Optional[str]
+        relativeTo: Optional[str]
 
     # these must be lists in order to have more than one. Their index in the list is how they will be referenced in the
     # note string templates
     osquery: Optional[List[OsQuery]]
-    insight: Optional[List[Insight]]
+    investigate: Optional[List[Investigate]]
 
-    @validates_schema
-    def validate_transforms(self, value: dict, **kwargs):
-        """Validate transform fields."""
-        # temporarily invalidate insights until schema stabilizes
-        insight = value.get('insight')
-        if insight is not None:
-            raise NotImplementedError('Insights are not stable yet.')
-        return
-
-    def render_insight_osquery_to_string(self) -> Dict[Literal['osquery', 'insight'], List[str]]:
+    def render_investigate_osquery_to_string(self) -> Dict[definitions.TransformTypes, List[str]]:
         obj = self.to_dict()
 
-        rendered: Dict[Literal['osquery', 'insight'], List[str]] = {'osquery': [], 'insight': []}
+        rendered: Dict[definitions.TransformTypes, List[str]] = {'osquery': [], 'investigate': []}
         for plugin, entries in obj.items():
             for entry in entries:
                 rendered[plugin].append(f'!{{{plugin}{json.dumps(entry, sort_keys=True, separators=(",", ":"))}}}')
@@ -132,6 +176,14 @@ class BaseThreatEntry:
     id: str
     name: str
     reference: str
+
+    @pre_load
+    def modify_url(self, data: Dict[str, Any], **kwargs):
+        """Modify the URL to support MITRE ATT&CK URLS with and without trailing forward slash."""
+        if urlparse(data["reference"]).scheme:
+            if not data["reference"].endswith("/"):
+                data["reference"] += "/"
+        return data
 
 
 @dataclass(frozen=True)
@@ -219,20 +271,77 @@ class FlatThreatMapping(MarshmallowDataclassMixin):
 
 
 @dataclass(frozen=True)
+class AlertSuppressionDuration:
+    """Mapping to alert suppression duration."""
+    unit: definitions.TimeUnits
+    value: definitions.AlertSuppressionValue
+
+
+@dataclass(frozen=True)
 class AlertSuppressionMapping(MarshmallowDataclassMixin, StackCompatMixin):
     """Mapping to alert suppression."""
-    @dataclass
-    class AlertSuppressionDuration:
-        """Mapping to allert suppression duration."""
-        unit: definitions.TimeUnits
-        value: int
 
-    group_by: List[definitions.NonEmptyStr]
-    duration: Optional[AlertSuppressionDuration] = field(metadata=dict(metadata=dict(min_compat="8.7")))
+    group_by: definitions.AlertSuppressionGroupBy
+    duration: Optional[AlertSuppressionDuration]
+    missing_fields_strategy: definitions.AlertSuppressionMissing
+
+
+@dataclass(frozen=True)
+class ThresholdAlertSuppression:
+    """Mapping to alert suppression."""
+
+    duration: AlertSuppressionDuration
+
+
+@dataclass(frozen=True)
+class FilterStateStore:
+    store: definitions.StoreType
+
+
+@dataclass(frozen=True)
+class FilterMeta:
+    alias: Optional[Union[str, None]] = None
+    disabled: Optional[bool] = None
+    negate: Optional[bool] = None
+    controlledBy: Optional[str] = None  # identify who owns the filter
+    group: Optional[str] = None  # allows grouping of filters
+    index: Optional[str] = None
+    isMultiIndex: Optional[bool] = None
+    type: Optional[str] = None
+    key: Optional[str] = None
+    params: Optional[str] = None  # Expand to FilterMetaParams when needed
+    value: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class WildcardQuery:
+    case_insensitive: bool
+    value: str
+
+
+@dataclass(frozen=True)
+class Query:
+    wildcard: Optional[Dict[str, WildcardQuery]] = None
+
+
+@dataclass(frozen=True)
+class Filter:
+    """Kibana Filter for Base Rule Data."""
+    # TODO: Currently unused in BaseRuleData. Revisit to extend or remove.
+    # https://github.com/elastic/detection-rules/issues/3773
+    meta: FilterMeta
+    state: Optional[FilterStateStore] = field(metadata=dict(data_key="$state"))
+    query: Optional[Union[Query, Dict[str, Any]]] = None
 
 
 @dataclass(frozen=True)
 class BaseRuleData(MarshmallowDataclassMixin, StackCompatMixin):
+    """Base rule data."""
+
+    @dataclass
+    class InvestigationFields:
+        field_names: List[definitions.NonEmptyStr]
+
     @dataclass
     class RequiredFields:
         name: definitions.NonEmptyStr
@@ -246,7 +355,6 @@ class BaseRuleData(MarshmallowDataclassMixin, StackCompatMixin):
         integration: Optional[definitions.NonEmptyStr]
 
     actions: Optional[list]
-    alert_suppression: Optional[AlertSuppressionMapping] = field(metadata=dict(metadata=dict(min_compat="8.6")))
     author: List[str]
     building_block_type: Optional[definitions.BuildingBlockType]
     description: str
@@ -258,6 +366,7 @@ class BaseRuleData(MarshmallowDataclassMixin, StackCompatMixin):
     # trailing `_` required since `from` is a reserved word in python
     from_: Optional[str] = field(metadata=dict(data_key="from"))
     interval: Optional[definitions.Interval]
+    investigation_fields: Optional[InvestigationFields] = field(metadata=dict(metadata=dict(min_compat="8.11")))
     max_signals: Optional[definitions.MaxSignals]
     meta: Optional[Dict[str, Any]]
     name: definitions.RuleName
@@ -268,11 +377,12 @@ class BaseRuleData(MarshmallowDataclassMixin, StackCompatMixin):
     references: Optional[List[str]]
     related_integrations: Optional[List[RelatedIntegrations]] = field(metadata=dict(metadata=dict(min_compat="8.3")))
     required_fields: Optional[List[RequiredFields]] = field(metadata=dict(metadata=dict(min_compat="8.3")))
+    revision: Optional[int] = field(metadata=dict(metadata=dict(min_compat="8.8")))
     risk_score: definitions.RiskScore
     risk_score_mapping: Optional[List[RiskScoreMapping]]
     rule_id: definitions.UUIDString
     rule_name_override: Optional[str]
-    setup: Optional[str] = field(metadata=dict(metadata=dict(min_compat="8.3")))
+    setup: Optional[definitions.Markdown] = field(metadata=dict(metadata=dict(min_compat="8.3")))
     severity_mapping: Optional[List[SeverityMapping]]
     severity: definitions.Severity
     tags: Optional[List[str]]
@@ -283,6 +393,7 @@ class BaseRuleData(MarshmallowDataclassMixin, StackCompatMixin):
     to: Optional[str]
     type: definitions.RuleType
     threat: Optional[List[ThreatMapping]]
+    version: Optional[definitions.PositiveInteger]
 
     @classmethod
     def save_schema(cls):
@@ -342,12 +453,12 @@ class BaseRuleData(MarshmallowDataclassMixin, StackCompatMixin):
         # only create functions that CAREFULLY mutate the obj dict
 
         def process_note_plugins():
-            """Format the note field with osquery and insight plugin strings."""
+            """Format the note field with osquery and investigate plugin strings."""
             note = obj.get('note')
             if not note:
                 return
 
-            rendered = transform.render_insight_osquery_to_string()
+            rendered = transform.render_investigate_osquery_to_string()
             rendered_patterns = {}
             for plugin, entries in rendered.items():
                 rendered_patterns.update(**{f'{plugin}_{i}': e for i, e in enumerate(entries)})
@@ -361,6 +472,23 @@ class BaseRuleData(MarshmallowDataclassMixin, StackCompatMixin):
             process_note_plugins()
 
         return obj
+
+    @validates_schema
+    def validates_data(self, data, **kwargs):
+        """Validate fields and data for marshmallow schemas."""
+
+        # Validate version and revision fields not supplied.
+        disallowed_fields = [field for field in ['version', 'revision'] if data.get(field) is not None]
+        if not disallowed_fields:
+            return
+
+        error_message = " and ".join(disallowed_fields)
+
+        # If version and revision fields are supplied, and using locked versions raise an error.
+        if BYPASS_VERSION_LOCK is not True:
+            msg = (f"Configuration error: Rule {data['name']} - {data['rule_id']} "
+                   f"should not contain rules with `{error_message}` set.")
+            raise ValidationError(msg)
 
 
 class DataValidator:
@@ -450,7 +578,7 @@ class DataValidator:
                 raise ValidationError(
                     f"{self.name} is invalid."
                     "Default BBR require `from` and `interval` to be at least now-119m and at least 60m respectively "
-                    "(using the now-Xm and Xm format where x is in minuets). "
+                    "(using the now-Xm and Xm format where x is in minutes). "
                     "Please update values or bypass. " + bypass_instructions
                 )
 
@@ -485,7 +613,7 @@ class DataValidator:
                                   f"field, use the environment variable `DR_BYPASS_NOTE_VALIDATION_AND_PARSE`")
 
         # raise if setup header is in note and in setup
-        if self.setup_in_note and self.setup:
+        if self.setup_in_note and (self.setup and self.setup != "None"):
             raise ValidationError("Setup header found in both note and setup fields.")
 
 
@@ -505,8 +633,11 @@ class QueryValidator:
         raise NotImplementedError()
 
     @cached
-    def get_required_fields(self, index: str) -> List[dict]:
+    def get_required_fields(self, index: str) -> List[Optional[dict]]:
         """Retrieves fields needed for the query along with type information from the schema."""
+        if isinstance(self, ESQLValidator):
+            return []
+
         current_version = Version.parse(load_current_package_version(), optional_minor_and_patch=True)
         ecs_version = get_stack_schemas()[str(current_version)]['ecs']
         beats_version = get_stack_schemas()[str(current_version)]['beats']
@@ -516,6 +647,21 @@ class QueryValidator:
         beat_types, beat_schema, schema = self.get_beats_schema(index or [], beats_version, ecs_version)
         endgame_schema = self.get_endgame_schema(index or [], endgame_version)
 
+        # construct integration schemas
+        packages_manifest = load_integrations_manifests()
+        integrations_schemas = load_integrations_schemas()
+        datasets, _ = beats.get_datasets_and_modules(self.ast)
+        package_integrations = parse_datasets(datasets, packages_manifest)
+        int_schema = {}
+        data = {"notify": False}
+
+        for pk_int in package_integrations:
+            package = pk_int["package"]
+            integration = pk_int["integration"]
+            schema, _ = get_integration_schema_fields(integrations_schemas, package, integration,
+                                                      current_version, packages_manifest, {}, data)
+            int_schema.update(schema)
+
         required = []
         unique_fields = self.unique_fields or []
 
@@ -524,7 +670,9 @@ class QueryValidator:
             is_ecs = field_type is not None
 
             if not is_ecs:
-                if beat_schema:
+                if int_schema:
+                    field_type = int_schema.get(fld, None)
+                elif beat_schema:
                     field_type = beat_schema.get(fld, {}).get('type')
                 elif endgame_schema:
                     field_type = endgame_schema.endgame_schema.get(fld, None)
@@ -545,7 +693,7 @@ class QueryValidator:
     def get_endgame_schema(self, index: list, endgame_version: str) -> Optional[endgame.EndgameSchema]:
         """Get an assembled flat endgame schema."""
 
-        if "endgame-*" not in index:
+        if index and "endgame-*" not in index:
             return None
 
         endgame_schema = endgame.read_endgame_schema(endgame_version=endgame_version)
@@ -558,8 +706,20 @@ class QueryRuleData(BaseRuleData):
     type: Literal["query"]
 
     index: Optional[List[str]]
+    data_view_id: Optional[str]
     query: str
     language: definitions.FilterLanguages
+    alert_suppression: Optional[AlertSuppressionMapping] = field(metadata=dict(metadata=dict(min_compat="8.8")))
+
+    @cached_property
+    def index_or_dataview(self) -> list[str]:
+        """Return the index or dataview depending on which is set. If neither returns empty list."""
+        if self.index is not None:
+            return self.index
+        elif self.data_view_id is not None:
+            return [self.data_view_id]
+        else:
+            return []
 
     @cached_property
     def validator(self) -> Optional[QueryValidator]:
@@ -567,6 +727,8 @@ class QueryRuleData(BaseRuleData):
             return KQLValidator(self.query)
         elif self.language == "eql":
             return EQLValidator(self.query)
+        elif self.language == "esql":
+            return ESQLValidator(self.query)
 
     def validate_query(self, meta: RuleMeta) -> None:
         validator = self.validator
@@ -591,6 +753,12 @@ class QueryRuleData(BaseRuleData):
         if validator is not None:
             return validator.get_required_fields(index or [])
 
+    @validates_schema
+    def validates_index_and_data_view_id(self, data, **kwargs):
+        """Validate that either index or data_view_id is set, but not both."""
+        if data.get('index') and data.get('data_view_id'):
+            raise ValidationError("Only one of index or data_view_id should be set.")
+
 
 @dataclass(frozen=True)
 class MachineLearningRuleData(BaseRuleData):
@@ -598,6 +766,7 @@ class MachineLearningRuleData(BaseRuleData):
 
     anomaly_threshold: int
     machine_learning_job_id: Union[str, List[str]]
+    alert_suppression: Optional[AlertSuppressionMapping] = field(metadata=dict(metadata=dict(min_compat="8.15")))
 
 
 @dataclass(frozen=True)
@@ -617,6 +786,7 @@ class ThresholdQueryRuleData(QueryRuleData):
 
     type: Literal["threshold"]
     threshold: ThresholdMapping
+    alert_suppression: Optional[ThresholdAlertSuppression] = field(metadata=dict(metadata=dict(min_compat="8.12")))
 
 
 @dataclass(frozen=True)
@@ -636,57 +806,31 @@ class NewTermsRuleData(QueryRuleData):
 
     type: Literal["new_terms"]
     new_terms: NewTermsMapping
+    alert_suppression: Optional[AlertSuppressionMapping] = field(metadata=dict(metadata=dict(min_compat="8.14")))
 
-    def validate(self, meta: RuleMeta) -> None:
-        """Validates terms in new_terms_fields are valid ECS schema."""
+    @pre_load
+    def preload_data(self, data: dict, **kwargs) -> dict:
+        """Preloads and formats the data to match the required schema."""
+        if "new_terms_fields" in data and "history_window_start" in data:
+            new_terms_mapping = {
+                "field": "new_terms_fields",
+                "value": data["new_terms_fields"],
+                "history_window_start": [
+                    {
+                        "field": "history_window_start",
+                        "value": data["history_window_start"]
+                    }
+                ]
+            }
+            data["new_terms"] = new_terms_mapping
 
-        kql_validator = KQLValidator(self.query)
-        kql_validator.validate(self, meta)
-        feature_min_stack = Version.parse('8.4.0')
-        feature_min_stack_extended_fields = Version.parse('8.6.0')
-
-        # validate history window start field exists and is correct
-        assert self.new_terms.history_window_start, \
-            "new terms field found with no history_window_start field defined"
-        assert self.new_terms.history_window_start[0].field == "history_window_start", \
-            f"{self.new_terms.history_window_start} should be 'history_window_start'"
-
-        # validate new terms and history window start fields is correct
-        assert self.new_terms.field == "new_terms_fields", \
-            f"{self.new_terms.field} should be 'new_terms_fields' for new_terms rule type"
-
-        # ecs validation
-        min_stack_version = meta.get("min_stack_version")
-        if min_stack_version is None:
-            min_stack_version = Version.parse(load_current_package_version(), optional_minor_and_patch=True)
-        else:
-            min_stack_version = Version.parse(min_stack_version)
-
-        assert min_stack_version >= feature_min_stack, \
-            f"New Terms rule types only compatible with {feature_min_stack}+"
-        ecs_version = get_stack_schemas()[str(min_stack_version)]['ecs']
-        beats_version = get_stack_schemas()[str(min_stack_version)]['beats']
-
-        # checks if new terms field(s) are in ecs, beats or non-ecs schemas
-        _, _, schema = kql_validator.get_beats_schema(self.index or [], beats_version, ecs_version)
-
-        for new_terms_field in self.new_terms.value:
-            assert new_terms_field in schema.keys(), \
-                f"{new_terms_field} not found in ECS, Beats, or non-ecs schemas"
-
-        # validates length of new_terms to stack version - https://github.com/elastic/kibana/issues/142862
-        if min_stack_version >= feature_min_stack and \
-                min_stack_version < feature_min_stack_extended_fields:
-            assert len(self.new_terms.value) == 1, \
-                f"new terms have a max limit of 1 for stack versions below {feature_min_stack_extended_fields}"
-
-        # validate fields are unique
-        assert len(set(self.new_terms.value)) == len(self.new_terms.value), \
-            f"new terms fields values are not unique - {self.new_terms.value}"
+            # cleanup original fields after building into our toml format
+            data.pop("new_terms_fields")
+            data.pop("history_window_start")
+        return data
 
     def transform(self, obj: dict) -> dict:
         """Transforms new terms data to API format for Kibana."""
-
         obj[obj["new_terms"].get("field")] = obj["new_terms"].get("value")
         obj["history_window_start"] = obj["new_terms"]["history_window_start"][0].get("value")
         del obj["new_terms"]
@@ -701,6 +845,7 @@ class EQLRuleData(QueryRuleData):
     timestamp_field: Optional[str] = field(metadata=dict(metadata=dict(min_compat="8.0")))
     event_category_override: Optional[str] = field(metadata=dict(metadata=dict(min_compat="8.0")))
     tiebreaker_field: Optional[str] = field(metadata=dict(metadata=dict(min_compat="8.0")))
+    alert_suppression: Optional[AlertSuppressionMapping] = field(metadata=dict(metadata=dict(min_compat="8.14")))
 
     def convert_relative_delta(self, lookback: str) -> int:
         now = len("now")
@@ -714,6 +859,11 @@ class EQLRuleData(QueryRuleData):
             return amount * (-1 if sign == "-" else 1)
         else:
             return convert_time_span(lookback)
+
+    @cached_property
+    def is_sample(self) -> bool:
+        """Checks if the current rule is a sample-based rule."""
+        return eql.utils.get_query_type(self.ast) == 'sample'
 
     @cached_property
     def is_sequence(self) -> bool:
@@ -747,6 +897,44 @@ class EQLRuleData(QueryRuleData):
 
 
 @dataclass(frozen=True)
+class ESQLRuleData(QueryRuleData):
+    """ESQL rules are a special case of query rules."""
+    type: Literal["esql"]
+    language: Literal["esql"]
+    query: str
+    alert_suppression: Optional[AlertSuppressionMapping] = field(metadata=dict(metadata=dict(min_compat="8.15")))
+
+    @validates_schema
+    def validates_esql_data(self, data, **kwargs):
+        """Custom validation for query rule type and subclasses."""
+        if data.get('index'):
+            raise ValidationError("Index is not a valid field for ES|QL rule type.")
+
+        # Convert the query string to lowercase to handle case insensitivity
+        query_lower = data['query'].lower()
+
+        # Combine both patterns using an OR operator and compile the regex
+        combined_pattern = re.compile(
+            r'(from\s+\S+\s+metadata\s+_id,\s*_version,\s*_index)|(\bstats\b.*?\bby\b)', re.DOTALL
+        )
+
+        # Ensure that non-aggregate queries have metadata
+        if not combined_pattern.search(query_lower):
+            raise ValidationError(
+                f"Rule: {data['name']} contains a non-aggregate query without"
+                f" metadata fields '_id', '_version', and '_index' ->"
+                f" Add 'metadata _id, _version, _index' to the from command or add an aggregate function."
+            )
+
+        # Enforce KEEP command for ESQL rules
+        if '| keep' not in query_lower:
+            raise ValidationError(
+                f"Rule: {data['name']} does not contain a 'keep' command ->"
+                f" Add a 'keep' command to the query."
+            )
+
+
+@dataclass(frozen=True)
 class ThreatMatchRuleData(QueryRuleData):
     """Specific fields for indicator (threat) match rule."""
 
@@ -772,6 +960,7 @@ class ThreatMatchRuleData(QueryRuleData):
     threat_language: Optional[definitions.FilterLanguages]
     threat_index: List[str]
     threat_indicator_path: Optional[str]
+    alert_suppression: Optional[AlertSuppressionMapping] = field(metadata=dict(metadata=dict(min_compat="8.13")))
 
     def validate_query(self, meta: RuleMeta) -> None:
         super(ThreatMatchRuleData, self).validate_query(meta)
@@ -792,7 +981,7 @@ class ThreatMatchRuleData(QueryRuleData):
 
 # All of the possible rule types
 # Sort inverse of any inheritance - see comment in TOMLRuleContents.to_dict
-AnyRuleData = Union[EQLRuleData, ThresholdQueryRuleData, ThreatMatchRuleData,
+AnyRuleData = Union[EQLRuleData, ESQLRuleData, ThresholdQueryRuleData, ThreatMatchRuleData,
                     MachineLearningRuleData, QueryRuleData, NewTermsRuleData]
 
 
@@ -820,7 +1009,7 @@ class BaseRuleContents(ABC):
         pass
 
     def lock_info(self, bump=True) -> dict:
-        version = self.autobumped_version if bump else (self.latest_version or 1)
+        version = self.autobumped_version if bump else (self.saved_version or 1)
         contents = {"rule_name": self.name, "sha256": self.sha256(), "version": version, "type": self.type}
 
         return contents
@@ -867,19 +1056,42 @@ class BaseRuleContents(ABC):
             return max_allowable_version - current_version - 1
 
     @property
-    def latest_version(self) -> Optional[int]:
-        """Retrieve the latest known version of the rule."""
-        min_stack = self.get_supported_version()
-        return self.version_lock.get_locked_version(self.id, min_stack)
+    def saved_version(self) -> Optional[int]:
+        """Retrieve the version from the version.lock or from the file if version locking is bypassed."""
+        toml_version = self.data.get("version")
+
+        if BYPASS_VERSION_LOCK:
+            return toml_version
+
+        if toml_version:
+            print(f"WARNING: Rule {self.name} - {self.id} has a version set in the rule TOML."
+                  " This `version` will be ignored and defaulted to the version.lock.json file."
+                  " Set `bypass_version_lock` to `True` in the rules config to use the TOML version.")
+
+        return self.version_lock.get_locked_version(self.id, self.get_supported_version())
 
     @property
     def autobumped_version(self) -> Optional[int]:
         """Retrieve the current version of the rule, accounting for automatic increments."""
-        version = self.latest_version
+        version = self.saved_version
+
+        if BYPASS_VERSION_LOCK:
+            raise NotImplementedError("This method is not implemented when version locking is not in use.")
+
+        # Default to version 1 if no version is set yet
         if version is None:
             return 1
 
+        # Auto-increment version if the rule is 'dirty' and not bypassing version lock
         return version + 1 if self.is_dirty else version
+
+    def get_synthetic_version(self, use_default: bool) -> Optional[int]:
+        """
+        Get the latest actual representation of a rule's version, where changes are accounted for automatically when
+        version locking is used, otherwise, return the version defined in the rule toml if present else optionally
+        default to 1.
+        """
+        return self.autobumped_version or self.saved_version or (1 if use_default else None)
 
     @classmethod
     def convert_supported_version(cls, stack_version: Optional[str]) -> Version:
@@ -928,12 +1140,21 @@ class TOMLRuleContents(BaseRuleContents, MarshmallowDataclassMixin):
     @cached_property
     def version_lock(self):
         # VersionLock
-        from .version_lock import default_version_lock
+        from .version_lock import loaded_version_lock
 
-        return getattr(self, '_version_lock', None) or default_version_lock
+        if RULES_CONFIG.bypass_version_lock is True:
+            err_msg = "Cannot access the version lock when the versioning strategy is configured to bypass the" \
+                      " version lock. Set `bypass_version_lock` to `false` in the rules config to use the version lock."
+            raise ValueError(err_msg)
+
+        return getattr(self, '_version_lock', None) or loaded_version_lock
 
     def set_version_lock(self, value):
         from .version_lock import VersionLock
+
+        err_msg = "Cannot set the version lock when the versioning strategy is configured to bypass the version lock." \
+                  " Set `bypass_version_lock` to `false` in the rules config to use the version lock."
+        assert not RULES_CONFIG.bypass_version_lock, err_msg
 
         if value and not isinstance(value, VersionLock):
             raise TypeError(f'version lock property must be set with VersionLock objects only. Got {type(value)}')
@@ -972,6 +1193,20 @@ class TOMLRuleContents(BaseRuleContents, MarshmallowDataclassMixin):
     def type(self) -> str:
         return self.data.type
 
+    def _add_known_nulls(self, rule_dict: dict) -> dict:
+        """Add known nulls to the rule."""
+        # Note this is primarily as a stopgap until add support for Rule Actions
+        for pair in definitions.KNOWN_NULL_ENTRIES:
+            for compound_key, sub_key in pair.items():
+                value = get_nested_value(rule_dict, compound_key)
+                if isinstance(value, list):
+                    items_to_update = [
+                        item for item in value if isinstance(item, dict) and get_nested_value(item, sub_key) is None
+                    ]
+                    for item in items_to_update:
+                        set_nested_value(item, sub_key, None)
+        return rule_dict
+
     def _post_dict_conversion(self, obj: dict) -> dict:
         """Transform the converted API in place before sending to Kibana."""
         super()._post_dict_conversion(obj)
@@ -1001,30 +1236,35 @@ class TOMLRuleContents(BaseRuleContents, MarshmallowDataclassMixin):
             current_stack_version = load_current_package_version()
 
             if self.check_restricted_field_version(field_name):
-                if isinstance(self.data, QueryRuleData) and self.data.language != 'lucene':
-                    package_integrations = self.get_packaged_integrations(self.data, self.metadata, packages_manifest)
+                if (isinstance(self.data, QueryRuleData) or isinstance(self.data, MachineLearningRuleData)):
+                    if (self.data.get('language') is not None and self.data.get('language') != 'lucene') or \
+                            self.data.get('type') == 'machine_learning':
+                        package_integrations = self.get_packaged_integrations(self.data, self.metadata,
+                                                                              packages_manifest)
 
-                    if not package_integrations:
-                        return
+                        if not package_integrations:
+                            return
 
-                    for package in package_integrations:
-                        package["version"] = find_least_compatible_version(
-                            package=package["package"],
-                            integration=package["integration"],
-                            current_stack_version=current_stack_version,
-                            packages_manifest=packages_manifest)
+                        for package in package_integrations:
+                            package["version"] = find_least_compatible_version(
+                                package=package["package"],
+                                integration=package["integration"],
+                                current_stack_version=current_stack_version,
+                                packages_manifest=packages_manifest)
 
-                        # if integration is not a policy template remove
-                        if package["version"]:
-                            policy_templates = packages_manifest[
-                                package["package"]][package["version"].strip("^")]["policy_templates"]
-                            if package["integration"] not in policy_templates:
-                                del package["integration"]
+                            # if integration is not a policy template remove
+                            if package["version"]:
+                                version_data = packages_manifest.get(package["package"],
+                                                                     {}).get(package["version"].strip("^"), {})
+                                policy_templates = version_data.get("policy_templates", [])
 
-                # remove duplicate entries
-                package_integrations = list({json.dumps(d, sort_keys=True):
-                                            d for d in package_integrations}.values())
-                obj.setdefault("related_integrations", package_integrations)
+                                if package["integration"] not in policy_templates:
+                                    del package["integration"]
+
+                    # remove duplicate entries
+                    package_integrations = list({json.dumps(d, sort_keys=True):
+                                                d for d in package_integrations}.values())
+                    obj.setdefault("related_integrations", package_integrations)
 
     def _convert_add_required_fields(self, obj: dict) -> None:
         """Add restricted field required_fields to the obj, derived from the query AST."""
@@ -1109,32 +1349,22 @@ class TOMLRuleContents(BaseRuleContents, MarshmallowDataclassMixin):
     def get_packaged_integrations(cls, data: QueryRuleData, meta: RuleMeta,
                                   package_manifest: dict) -> Optional[List[dict]]:
         packaged_integrations = []
-        datasets = set()
+        datasets, _ = beats.get_datasets_and_modules(data.get('ast') or [])
 
-        for node in data.get('ast', []):
-            if isinstance(node, eql.ast.Comparison) and str(node.left) == 'event.dataset':
-                datasets.update(set(n.value for n in node if isinstance(n, eql.ast.Literal)))
-            elif isinstance(node, FieldComparison) and str(node.field) == 'event.dataset':
-                datasets.update(set(str(n) for n in node if isinstance(n, kql.ast.Value)))
+        # integration is None to remove duplicate references upstream in Kibana
+        # chronologically, event.dataset is checked for package:integration, then rule tags
+        # if both exist, rule tags are only used if defined in definitions for non-dataset packages
+        # of machine learning analytic packages
 
-        if not datasets:
-            # windows and endpoint integration do not have event.dataset fields in queries
-            # integration is None to remove duplicate references upstream in Kibana
-            rule_integrations = meta.get("integration", [])
-            if rule_integrations:
-                for integration in rule_integrations:
-                    if integration in definitions.NON_DATASET_PACKAGES:
-                        packaged_integrations.append({"package": integration, "integration": None})
+        rule_integrations = meta.get("integration", [])
+        if rule_integrations:
+            for integration in rule_integrations:
+                ineligible_integrations = definitions.NON_DATASET_PACKAGES + \
+                    [*map(str.lower, definitions.MACHINE_LEARNING_PACKAGES)]
+                if integration in ineligible_integrations or isinstance(data, MachineLearningRuleData):
+                    packaged_integrations.append({"package": integration, "integration": None})
 
-        for value in sorted(datasets):
-            integration = 'Unknown'
-            if '.' in value:
-                package, integration = value.split('.', 1)
-            else:
-                package = value
-
-            if package in list(package_manifest):
-                packaged_integrations.append({"package": package, "integration": integration})
+        packaged_integrations.extend(parse_datasets(datasets, package_manifest))
 
         return packaged_integrations
 
@@ -1144,10 +1374,31 @@ class TOMLRuleContents(BaseRuleContents, MarshmallowDataclassMixin):
         data: AnyRuleData = value["data"]
         metadata: RuleMeta = value["metadata"]
 
-        data.validate_query(metadata)
-        data.data_validator.validate_note()
-        data.data_validator.validate_bbr(metadata.get('bypass_bbr_timing'))
-        data.validate(metadata) if hasattr(data, 'validate') else False
+        test_config = RULES_CONFIG.test_config
+        if not test_config.check_skip_by_rule_id(value['data'].rule_id):
+            data.validate_query(metadata)
+            data.data_validator.validate_note()
+            data.data_validator.validate_bbr(metadata.get('bypass_bbr_timing'))
+            data.validate(metadata) if hasattr(data, 'validate') else False
+
+    @staticmethod
+    def validate_remote(remote_validator: 'RemoteValidator', contents: 'TOMLRuleContents'):
+        remote_validator.validate_rule(contents)
+
+    @classmethod
+    def from_rule_resource(
+        cls, rule: dict, creation_date: str = TIME_NOW, updated_date: str = TIME_NOW, maturity: str = 'development'
+    ) -> 'TOMLRuleContents':
+        """Create a TOMLRuleContents from a kibana rule resource."""
+        integrations = [r.get("package") for r in rule.get("related_integrations")]
+        meta = {
+            "creation_date": creation_date,
+            "updated_date": updated_date,
+            "maturity": maturity,
+            "integration": integrations,
+        }
+        contents = cls.from_dict({'metadata': meta, 'rule': rule, 'transforms': None}, unknown=marshmallow.EXCLUDE)
+        return contents
 
     def to_dict(self, strip_none_values=True) -> dict:
         # Load schemas directly from the data and metadata classes to avoid schema ambiguity which can
@@ -1164,10 +1415,15 @@ class TOMLRuleContents(BaseRuleContents, MarshmallowDataclassMixin):
         flattened.update(self.metadata.to_dict())
         return flattened
 
-    def to_api_format(self, include_version=True) -> dict:
+    def to_api_format(self, include_version: bool = not BYPASS_VERSION_LOCK, include_metadata: bool = False) -> dict:
         """Convert the TOML rule to the API format."""
-        converted_data = self.to_dict()['rule']
+        rule_dict = self.to_dict()
+        rule_dict = self._add_known_nulls(rule_dict)
+        converted_data = rule_dict['rule']
         converted = self._post_dict_conversion(converted_data)
+
+        if include_metadata:
+            converted["meta"] = rule_dict['metadata']
 
         if include_version:
             converted["version"] = self.autobumped_version
@@ -1211,11 +1467,22 @@ class TOMLRule:
         """Generate the relevant fleet compatible asset."""
         return {"id": self.id, "attributes": self.contents.to_api_format(), "type": definitions.SAVED_OBJECT_TYPE}
 
-    def save_toml(self):
+    def get_base_rule_dir(self) -> Path | None:
+        """Get the base rule directory for the rule."""
+        rule_path = self.path.resolve()
+        for rules_dir in DEFAULT_PREBUILT_RULES_DIRS + DEFAULT_PREBUILT_BBR_DIRS:
+            if rule_path.is_relative_to(rules_dir):
+                return rule_path.relative_to(rules_dir)
+        return None
+
+    def save_toml(self, strip_none_values: bool = True):
         assert self.path is not None, f"Can't save rule {self.name} (self.id) without a path"
-        converted = dict(metadata=self.contents.metadata.to_dict(), rule=self.contents.data.to_dict())
+        converted = dict(
+            metadata=self.contents.metadata.to_dict(),
+            rule=self.contents.data.to_dict(strip_none_values=strip_none_values),
+        )
         if self.contents.transform:
-            converted['transform'] = self.contents.transform.to_dict()
+            converted["transform"] = self.contents.transform.to_dict()
         toml_write(converted, str(self.path.absolute()))
 
     def save_json(self, path: Path, include_version: bool = True):
@@ -1234,12 +1501,16 @@ class DeprecatedRuleContents(BaseRuleContents):
     @cached_property
     def version_lock(self):
         # VersionLock
-        from .version_lock import default_version_lock
+        from .version_lock import loaded_version_lock
 
-        return getattr(self, '_version_lock', None) or default_version_lock
+        return getattr(self, '_version_lock', None) or loaded_version_lock
 
     def set_version_lock(self, value):
         from .version_lock import VersionLock
+
+        err_msg = "Cannot set the version lock when the versioning strategy is configured to bypass the version lock." \
+                  " Set `bypass_version_lock` to `false` in the rules config to use the version lock."
+        assert not RULES_CONFIG.bypass_version_lock, err_msg
 
         if value and not isinstance(value, VersionLock):
             raise TypeError(f'version lock property must be set with VersionLock objects only. Got {type(value)}')
@@ -1265,7 +1536,7 @@ class DeprecatedRuleContents(BaseRuleContents):
         kwargs['transform'] = obj['transform'] if 'transform' in obj else None
         return cls(**kwargs)
 
-    def to_api_format(self, include_version=True) -> dict:
+    def to_api_format(self, include_version: bool = not BYPASS_VERSION_LOCK) -> dict:
         """Convert the TOML rule to the API format."""
         data = copy.deepcopy(self.data)
         if self.transform:
@@ -1300,14 +1571,45 @@ class DeprecatedRule(dict):
         return self.contents.name
 
 
-def downgrade_contents_from_rule(rule: TOMLRule, target_version: str) -> dict:
+def downgrade_contents_from_rule(rule: TOMLRule, target_version: str,
+                                 replace_id: bool = True, include_metadata: bool = False) -> dict:
     """Generate the downgraded contents from a rule."""
-    payload = rule.contents.to_api_format()
-    meta = payload.setdefault("meta", {})
-    meta["original"] = dict(id=rule.id, **rule.contents.metadata.to_dict())
-    payload["rule_id"] = str(uuid4())
-    payload = downgrade(payload, target_version)
+    rule_dict = rule.contents.to_dict()["rule"]
+    min_stack_version = target_version or rule.contents.metadata.min_stack_version or "8.3.0"
+    min_stack_version = Version.parse(min_stack_version,
+                                      optional_minor_and_patch=True)
+    rule_dict.setdefault("meta", {}).update(rule.contents.metadata.to_dict())
+
+    if replace_id:
+        rule_dict["rule_id"] = str(uuid4())
+
+    rule_dict = downgrade(rule_dict, target_version=str(min_stack_version))
+    meta = rule_dict.pop("meta")
+    rule_contents_dict = {"rule": rule_dict, "metadata": meta}
+
+    if rule.contents.transform:
+        rule_contents_dict["transform"] = rule.contents.transform.to_dict()
+
+    rule_contents = TOMLRuleContents.from_dict(rule_contents_dict)
+    payload = rule_contents.to_api_format(include_metadata=include_metadata)
+    payload = strip_non_public_fields(min_stack_version, payload)
     return payload
+
+
+def set_eql_config(min_stack_version: str) -> eql.parser.ParserConfig:
+    """Based on the rule version set the eql functions allowed."""
+    if not min_stack_version:
+        min_stack_version = Version.parse(load_current_package_version(), optional_minor_and_patch=True)
+    else:
+        min_stack_version = Version.parse(min_stack_version, optional_minor_and_patch=True)
+
+    config = eql.parser.ParserConfig()
+
+    for feature, version_range in definitions.ELASTICSEARCH_EQL_FEATURES.items():
+        if version_range[0] <= min_stack_version <= (version_range[1] or min_stack_version):
+            config.context[feature] = True
+
+    return config
 
 
 def get_unique_query_fields(rule: TOMLRule) -> List[str]:
@@ -1317,11 +1619,14 @@ def get_unique_query_fields(rule: TOMLRule) -> List[str]:
     query = contents.get('query')
     if language in ('kuery', 'eql'):
         # TODO: remove once py-eql supports ipv6 for cidrmatch
-        with eql.parser.elasticsearch_syntax, eql.parser.ignore_missing_functions:
-            parsed = kql.parse(query) if language == 'kuery' else eql.parse_query(query)
 
+        cfg = set_eql_config(rule.contents.metadata.get('min_stack_version'))
+        with eql.parser.elasticsearch_syntax, eql.parser.ignore_missing_functions, eql.parser.skip_optimizations, cfg:
+            parsed = (kql.parse(query, normalize_kql_keywords=RULES_CONFIG.normalize_kql_keywords)
+                      if language == 'kuery' else eql.parse_query(query))
         return sorted(set(str(f) for f in parsed if isinstance(f, (eql.ast.Field, kql.ast.Field))))
 
 
 # avoid a circular import
-from .rule_validators import EQLValidator, KQLValidator  # noqa: E402
+from .rule_validators import EQLValidator, ESQLValidator, KQLValidator  # noqa: E402
+from .remote_validation import RemoteValidator  # noqa: E402

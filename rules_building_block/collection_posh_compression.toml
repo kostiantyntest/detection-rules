@@ -1,10 +1,11 @@
 [metadata]
+bypass_bbr_timing = true
 creation_date = "2023/07/06"
 integration = ["windows"]
 maturity = "production"
-min_stack_comments = "New fields added: required_fields, related_integrations, setup"
-min_stack_version = "8.3.0"
-updated_date = "2023/07/06"
+min_stack_comments = "Breaking change at 8.14.0 for the Windows Integration."
+min_stack_version = "8.14.0"
+updated_date = "2025/01/10"
 
 
 [rule]
@@ -13,13 +14,14 @@ description = """
 Identifies the use of Cmdlets and methods related to archive compression activities. Adversaries will often compress and
 encrypt data in preparation for exfiltration.
 """
-from = "now-119m"
-interval = "60m"
-index = ["winlogbeat-*", "logs-windows.*"]
+from = "now-9m"
+index = ["winlogbeat-*", "logs-windows.powershell*"]
 language = "kuery"
 license = "Elastic License v2"
 name = "PowerShell Script with Archive Compression Capabilities"
-note = """## Setup
+risk_score = 21
+rule_id = "27071ea3-e806-4697-8abc-e22c92aa4293"
+setup = """## Setup
 
 The 'PowerShell Script Block Logging' logging policy must be enabled.
 Steps to implement the logging policy with Advanced Audit Configuration:
@@ -37,8 +39,6 @@ Steps to implement the logging policy via registry:
 reg add "hklm\\SOFTWARE\\Policies\\Microsoft\\Windows\\PowerShell\\ScriptBlockLogging" /v EnableScriptBlockLogging /t REG_DWORD /d 1
 ```
 """
-risk_score = 21
-rule_id = "27071ea3-e806-4697-8abc-e22c92aa4293"
 severity = "low"
 tags = ["Domain: Endpoint", "OS: Windows", "Use Case: Threat Detection", "Tactic: Collection", "Data Source: PowerShell Logs", "Rule Type: BBR"]
 timestamp_override = "event.ingested"
@@ -63,9 +63,52 @@ event.category:process and host.os.type:windows and
     "ZipArchiveMode"
   ) or
   powershell.file.script_block_text : "Compress-Archive"
+) and
+not powershell.file.script_block_text : (
+  "Compress-Archive -Path 'C:\ProgramData\Lenovo\Udc\diagnostics\latest" or
+  ("Copyright: (c) 2017, Ansible Project" and "Ansible.ModuleUtils.Backup")
+) and
+not file.directory : (
+  "C:\Program Files\Microsoft Dependency Agent\plugins\lib" or
+  "C:\Program Files\WindowsPowerShell\Modules\icinga-powershell-framework\cache" or
+  "C:\ProgramData\Microsoft\Windows Defender Advanced Threat Protection\Downloads"
 )
 '''
 
+[[rule.filters]]
+[rule.filters.meta]
+negate = true
+[rule.filters.query.wildcard."file.path"]
+"case_insensitive" = true
+"value" = "?:\\\\ProgramData\\\\Microsoft\\\\Windows Defender Advanced Threat Protection\\\\Downloads\\\\*"
+
+[[rule.filters]]
+[rule.filters.meta]
+negate = true
+[rule.filters.query.wildcard."file.path"]
+"case_insensitive" = true
+"value" = "?:\\\\ProgramData\\\\Microsoft\\\\Windows Defender Advanced Threat Protection\\\\DataCollection\\\\*"
+
+[[rule.filters]]
+[rule.filters.meta]
+negate = true
+[rule.filters.query.wildcard."file.path"]
+"case_insensitive" = true
+"value" = "?:\\\\Program Files\\\\WindowsPowerShell\\\\Modules\\\\dbatools\\\\*\\\\optional\\\\Expand-Archive.ps1"
+
+[[rule.filters]]
+[rule.filters.meta]
+negate = true
+[rule.filters.query.wildcard."file.path"]
+"case_insensitive" = true
+"value" = "?:\\\\Program Files\\\\WindowsPowerShell\\\\Modules\\\\dbatools\\\\*\\\\optional\\\\Compress-Archive.ps1"
+
+[[rule.filters]]
+[rule.filters.meta]
+negate = true
+[rule.filters.query.wildcard."file.path"]
+"case_insensitive" = true
+"value" = "?:\\\\Program Files\\\\Azure\\\\StorageSyncAgent\\\\AFSDiag.ps1"
 
 [[rule.threat]]
 framework = "MITRE ATT&CK"

@@ -4,18 +4,17 @@
 # 2.0.
 import json
 from collections import OrderedDict
-from pathlib import Path
 from typing import List, Optional
 from typing import OrderedDict as OrderedDictType
 
 import jsonschema
 from semver import Version
 
-from ..misc import load_current_package_version
-from ..utils import cached, get_etc_path, load_etc_dump
+from ..config import load_current_package_version, parse_rules_config
+from ..utils import cached, get_etc_path
 from . import definitions
-from .rta_schema import validate_rta_mapping
 from .stack_compat import get_incompatible_fields
+
 
 __all__ = (
     "SCHEMA_DIR",
@@ -25,17 +24,17 @@ __all__ = (
     "get_min_supported_stack_version",
     "get_stack_schemas",
     "get_stack_versions",
-    "validate_rta_mapping",
     "all_versions",
 )
 
-SCHEMA_DIR = Path(get_etc_path("api_schemas"))
+RULES_CONFIG = parse_rules_config()
+SCHEMA_DIR = get_etc_path("api_schemas")
 migrations = {}
 
 
 def all_versions() -> List[str]:
     """Get all known stack versions."""
-    return [str(v) for v in sorted(migrations)]
+    return [str(v) for v in sorted(migrations, key=lambda x: Version.parse(x, optional_minor_and_patch=True))]
 
 
 def migrate(version: str):
@@ -54,7 +53,7 @@ def migrate(version: str):
 
 @cached
 def get_schema_file(version: Version, rule_type: str) -> dict:
-    path = Path(SCHEMA_DIR) / str(version) / f"{version}.{rule_type}.json"
+    path = SCHEMA_DIR / str(version) / f"{version}.{rule_type}.json"
 
     if not path.exists():
         raise ValueError(f"Unsupported rule type {rule_type}. Unable to downgrade to {version}")
@@ -64,9 +63,6 @@ def get_schema_file(version: Version, rule_type: str) -> dict:
 
 def strip_additional_properties(version: Version, api_contents: dict) -> dict:
     """Remove all fields that the target schema doesn't recognize."""
-
-    if Version.parse(version, optional_minor_and_patch=True) >= Version.parse("8.3.0"):
-        api_contents = strip_build_time_fields(api_contents)
 
     stripped = {}
     target_schema = get_schema_file(version, api_contents["type"])
@@ -80,14 +76,13 @@ def strip_additional_properties(version: Version, api_contents: dict) -> dict:
     return stripped
 
 
-def strip_build_time_fields(api_contents: dict) -> dict:
-    """Remove all fields that are only used at build time."""
-    contents = api_contents.copy()
-    if "related_integrations" in contents:
-        del contents["related_integrations"]
-    if "required_fields" in contents:
-        del contents["required_fields"]
-    return contents
+def strip_non_public_fields(min_stack_version: Version, data_dict: dict) -> dict:
+    """Remove all non public fields."""
+    for field, version_range in definitions.NON_PUBLIC_FIELDS.items():
+        if version_range[0] <= min_stack_version <= (version_range[1] or min_stack_version):
+            if field in data_dict:
+                del data_dict[field]
+    return data_dict
 
 
 @migrate("7.8")
@@ -260,6 +255,54 @@ def migrate_to_8_9(version: Version, api_contents: dict) -> dict:
     return strip_additional_properties(version, api_contents)
 
 
+@migrate("8.10")
+def migrate_to_8_10(version: Version, api_contents: dict) -> dict:
+    """Default migration for 8.10."""
+    return strip_additional_properties(version, api_contents)
+
+
+@migrate("8.11")
+def migrate_to_8_11(version: Version, api_contents: dict) -> dict:
+    """Default migration for 8.11."""
+    return strip_additional_properties(version, api_contents)
+
+
+@migrate("8.12")
+def migrate_to_8_12(version: Version, api_contents: dict) -> dict:
+    """Default migration for 8.12."""
+    return strip_additional_properties(version, api_contents)
+
+
+@migrate("8.13")
+def migrate_to_8_13(version: Version, api_contents: dict) -> dict:
+    """Default migration for 8.13."""
+    return strip_additional_properties(version, api_contents)
+
+
+@migrate("8.14")
+def migrate_to_8_14(version: Version, api_contents: dict) -> dict:
+    """Default migration for 8.14."""
+    return strip_additional_properties(version, api_contents)
+
+
+@migrate("8.15")
+def migrate_to_8_15(version: Version, api_contents: dict) -> dict:
+    """Default migration for 8.15."""
+    return strip_additional_properties(version, api_contents)
+
+
+@migrate("8.16")
+def migrate_to_8_16(version: Version, api_contents: dict) -> dict:
+    """Default migration for 8.16."""
+    return strip_additional_properties(version, api_contents)
+
+
+@migrate("8.17")
+def migrate_to_8_17(version: Version, api_contents: dict) -> dict:
+    """Default migration for 8.17."""
+    return strip_additional_properties(version, api_contents)
+
+
 def downgrade(api_contents: dict, target_version: str, current_version: Optional[str] = None) -> dict:
     """Downgrade a rule to a target stack version."""
     from ..packaging import current_stack_version
@@ -286,12 +329,15 @@ def downgrade(api_contents: dict, target_version: str, current_version: Optional
 
 @cached
 def load_stack_schema_map() -> dict:
-    return load_etc_dump('stack-schema-map.yaml')
+    return RULES_CONFIG.stack_schema_map
 
 
 @cached
 def get_stack_schemas(stack_version: Optional[str] = '0.0.0') -> OrderedDictType[str, dict]:
-    """Return all ECS + beats to stack versions for every stack version >= specified stack version and <= package."""
+    """
+    Return all ECS, beats, and custom stack versions for every stack version.
+    Only versions >= specified stack version and <= package are returned.
+    """
     stack_version = Version.parse(stack_version or '0.0.0', optional_minor_and_patch=True)
     current_package = Version.parse(load_current_package_version(), optional_minor_and_patch=True)
 

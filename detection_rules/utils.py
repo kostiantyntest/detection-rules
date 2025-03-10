@@ -6,7 +6,6 @@
 """Util functions."""
 import base64
 import contextlib
-import distutils.spawn
 import functools
 import glob
 import gzip
@@ -14,9 +13,9 @@ import hashlib
 import io
 import json
 import os
+import re
 import shutil
 import subprocess
-import time
 import zipfile
 from dataclasses import is_dataclass, astuple
 from datetime import datetime, date
@@ -31,10 +30,11 @@ from eql.utils import load_dump, stream_json_lines
 
 import kql
 
-CURR_DIR = os.path.dirname(os.path.abspath(__file__))
-ROOT_DIR = os.path.dirname(CURR_DIR)
-ETC_DIR = os.path.join(ROOT_DIR, "detection_rules", "etc")
-INTEGRATION_RULE_DIR = os.path.join(ROOT_DIR, "rules", "integrations")
+
+CURR_DIR = Path(__file__).resolve().parent
+ROOT_DIR = CURR_DIR.parent
+ETC_DIR = ROOT_DIR / "detection_rules" / "etc"
+INTEGRATION_RULE_DIR = ROOT_DIR / "rules" / "integrations"
 
 
 class NonelessDict(dict):
@@ -60,7 +60,7 @@ def gopath() -> Optional[str]:
     if env_path:
         return env_path
 
-    go_bin = distutils.spawn.find_executable("go")
+    go_bin = shutil.which("go")
     if go_bin:
         output = subprocess.check_output([go_bin, "env"], encoding="utf-8").splitlines()
         for line in output:
@@ -86,20 +86,31 @@ def get_json_iter(f):
     return data
 
 
-def get_path(*paths) -> str:
+def get_nested_value(dictionary, compound_key):
+    """Get a nested value from a dictionary."""
+    keys = compound_key.split('.')
+    for key in keys:
+        if isinstance(dictionary, dict):
+            dictionary = dictionary.get(key)
+        else:
+            return None
+    return dictionary
+
+
+def get_path(*paths) -> Path:
     """Get a file by relative path."""
-    return os.path.join(ROOT_DIR, *paths)
+    return ROOT_DIR.joinpath(*paths)
 
 
-def get_etc_path(*paths):
+def get_etc_path(*paths) -> Path:
     """Load a file from the detection_rules/etc/ folder."""
-    return os.path.join(ETC_DIR, *paths)
+    return ETC_DIR.joinpath(*paths)
 
 
-def get_etc_glob_path(*patterns):
+def get_etc_glob_path(*patterns) -> list:
     """Load a file from the detection_rules/etc/ folder."""
     pattern = os.path.join(*patterns)
-    return glob.glob(os.path.join(ETC_DIR, pattern))
+    return glob.glob(str(ETC_DIR / pattern))
 
 
 def get_etc_file(name, mode="r"):
@@ -110,12 +121,12 @@ def get_etc_file(name, mode="r"):
 
 def load_etc_dump(*path):
     """Load a json/yml/toml file from the detection_rules/etc/ folder."""
-    return eql.utils.load_dump(get_etc_path(*path))
+    return eql.utils.load_dump(str(get_etc_path(*path)))
 
 
 def save_etc_dump(contents, *path, **kwargs):
     """Save a json/yml/toml file from the detection_rules/etc/ folder."""
-    path = get_etc_path(*path)
+    path = str(get_etc_path(*path))
     _, ext = os.path.splitext(path)
     sort_keys = kwargs.pop('sort_keys', True)
     indent = kwargs.pop('indent', 2)
@@ -125,6 +136,22 @@ def save_etc_dump(contents, *path, **kwargs):
             json.dump(contents, f, cls=DateTimeEncoder, sort_keys=sort_keys, indent=indent, **kwargs)
     else:
         return eql.utils.save_dump(contents, path)
+
+
+def set_all_validation_bypass(env_value: bool = False):
+    """Set all validation bypass environment variables."""
+    os.environ['DR_BYPASS_NOTE_VALIDATION_AND_PARSE'] = str(env_value)
+    os.environ['DR_BYPASS_BBR_LOOKBACK_VALIDATION'] = str(env_value)
+    os.environ['DR_BYPASS_TAGS_VALIDATION'] = str(env_value)
+    os.environ['DR_BYPASS_TIMELINE_TEMPLATE_VALIDATION'] = str(env_value)
+
+
+def set_nested_value(dictionary, compound_key, value):
+    """Set a nested value in a dictionary."""
+    keys = compound_key.split('.')
+    for key in keys[:-1]:
+        dictionary = dictionary.setdefault(key, {})
+    dictionary[keys[-1]] = value
 
 
 def gzip_compress(contents) -> bytes:
@@ -215,12 +242,12 @@ def event_sort(events, timestamp='@timestamp', date_format='%Y-%m-%dT%H:%M:%S.%f
 
         return t
 
-    def _event_sort(event):
-        """Calculates the sort key for an event."""
+    def _event_sort(event: dict) -> datetime:
+        """Calculates the sort key for an event as a datetime object."""
         t = round_microseconds(event[timestamp])
 
-        # Return the timestamp in seconds, adjusted for microseconds and then scaled to milliseconds
-        return (time.mktime(time.strptime(t, date_format)) + int(t.split('.')[-1][:-1]) / 1000) * 1000
+        # Return the timestamp as a datetime object for comparison
+        return datetime.strptime(t, date_format)
 
     return sorted(events, key=_event_sort, reverse=not asc)
 
@@ -241,9 +268,9 @@ def convert_time_span(span: str) -> int:
     return eql.ast.TimeRange(amount, unit).as_milliseconds()
 
 
-def evaluate(rule, events):
+def evaluate(rule, events, normalize_kql_keywords: bool = False):
     """Evaluate a query against events."""
-    evaluator = kql.get_evaluator(kql.parse(rule.query))
+    evaluator = kql.get_evaluator(kql.parse(rule.query), normalize_kql_keywords=normalize_kql_keywords)
     filtered = list(filter(evaluator, events))
     return filtered
 
@@ -308,6 +335,15 @@ def clear_caches():
     _cache.clear()
 
 
+def rulename_to_filename(name: str, tactic_name: str = None, ext: str = '.toml') -> str:
+    """Convert a rule name to a filename."""
+    name = re.sub(r'[^_a-z0-9]+', '_', name.strip().lower()).strip('_')
+    if tactic_name:
+        pre = rulename_to_filename(name=tactic_name, ext='')
+        name = f'{pre}_{name}'
+    return name + ext or ''
+
+
 def load_rule_contents(rule_file: Path, single_only=False) -> list:
     """Load a rule file from multiple formats."""
     _, extension = os.path.splitext(rule_file)
@@ -326,8 +362,10 @@ def load_rule_contents(rule_file: Path, single_only=False) -> list:
         return contents or [{}]
     elif extension == '.toml':
         rule = pytoml.loads(raw_text)
+    elif extension.lower() in ('yaml', 'yml'):
+        rule = load_dump(str(rule_file))
     else:
-        rule = load_dump(rule_file)
+        return []
 
     if isinstance(rule, dict):
         return [rule]

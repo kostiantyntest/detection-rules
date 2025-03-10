@@ -2,24 +2,21 @@
 creation_date = "2022/08/29"
 integration = ["system", "windows"]
 maturity = "production"
-min_stack_comments = "New fields added: required_fields, related_integrations, setup"
-min_stack_version = "8.3.0"
-updated_date = "2023/06/22"
+updated_date = "2025/02/21"
+min_stack_version = "8.14.0"
+min_stack_comments = "Breaking change at 8.14.0 for the Windows Integration."
 
 [rule]
 author = ["Elastic"]
-description = """
-Identifies a remote logon followed by a scheduled task creation on the target host. This could be indicative of
-adversary lateral movement.
-"""
+description = "Identifies scheduled task creation from a remote source. This could be indicative of adversary lateral movement.\n"
 from = "now-9m"
-index = ["winlogbeat-*", "logs-system.*", "logs-windows.*"]
+index = ["logs-system.security*", "logs-windows.forwarded*", "winlogbeat-*"]
 language = "eql"
 license = "Elastic License v2"
-name = "Remote Logon followed by Scheduled Task Creation"
+name = "Remote Scheduled Task Creation via RPC"
 note = """## Triage and analysis
 
-### Investigating Remote Scheduled Task Creation
+### Remote Scheduled Task Creation via RPC
 
 [Scheduled tasks](https://docs.microsoft.com/en-us/windows/win32/taskschd/about-the-task-scheduler) are a great mechanism for persistence and program execution. These features can be used remotely for a variety of legitimate reasons, but at the same time used by malware and adversaries. When investigating scheduled tasks that were set up remotely, one of the first steps should be to determine the original intent behind the configuration and to verify if the activity is tied to benign behavior such as software installation or any kind of network administrator work. One objective for these alerts is to understand the configured action within the scheduled task. This is captured within the registry event data for this rule and can be base64 decoded to view the value.
 
@@ -49,19 +46,20 @@ note = """## Triage and analysis
 risk_score = 47
 rule_id = "9c865691-5599-447a-bac9-b3f2df5f9a9d"
 severity = "medium"
-tags = ["Domain: Endpoint", "OS: Windows", "Use Case: Threat Detection", "Tactic: Lateral Movement"]
+tags = [
+    "Domain: Endpoint",
+    "OS: Windows",
+    "Use Case: Threat Detection",
+    "Tactic: Lateral Movement",
+    "Data Source: Windows Security Event Logs",
+    "Resources: Investigation Guide",
+]
+timestamp_override = "event.ingested"
 type = "eql"
 
 query = '''
-/* Network Logon followed by Scheduled Task creation  */
-
-sequence by winlog.computer_name with maxspan=1m
-  [authentication where event.action == "logged-in" and
-   winlog.logon.type == "Network" and event.outcome == "success" and
-   not user.name == "ANONYMOUS LOGON" and not winlog.event_data.SubjectUserName : "*$" and
-   not user.domain == "NT AUTHORITY" and source.ip != "127.0.0.1" and source.ip !="::1"] by winlog.event_data.TargetLogonId
-
-  [iam where event.action == "scheduled-task-created"] by winlog.event_data.SubjectLogonId
+iam where event.action == "scheduled-task-created" and
+ winlog.event_data.RpcCallClientLocality : "0" and winlog.event_data.ClientProcessId : "0"
 '''
 
 

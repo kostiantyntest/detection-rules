@@ -6,10 +6,14 @@
 """Test that the packages are built correctly."""
 import unittest
 import uuid
+from semver import Version
+from marshmallow import ValidationError
 
 from detection_rules import rule_loader
+from detection_rules.schemas.registry_package import (RegistryPackageManifestV1,
+                                                      RegistryPackageManifestV3)
 from detection_rules.packaging import PACKAGE_FILE, Package
-from detection_rules.rule_loader import RuleCollection
+
 from tests.base import BaseRuleTest
 
 package_configs = Package.load_configs()
@@ -49,20 +53,23 @@ class TestPackages(BaseRuleTest):
     def test_package_loader_production_config(self):
         """Test that packages are loading correctly."""
 
+    @unittest.skipIf(rule_loader.RULES_CONFIG.bypass_version_lock, 'Version lock bypassed')
     def test_package_loader_default_configs(self):
-        """Test configs in detection_rules/etc/packages.yml."""
-        Package.from_config(package_configs)
+        """Test configs in detection_rules/etc/packages.yaml."""
+        Package.from_config(rule_collection=self.rc, config=package_configs)
 
+    @unittest.skipIf(rule_loader.RULES_CONFIG.bypass_version_lock, 'Version lock bypassed')
     def test_package_summary(self):
         """Test the generation of the package summary."""
-        rules = self.production_rules
+        rules = self.rc
         package = Package(rules, 'test-package')
         package.generate_summary_and_changelog(package.changed_ids, package.new_ids, package.removed_ids)
 
+    @unittest.skipIf(rule_loader.RULES_CONFIG.bypass_version_lock, 'Version lock bypassed')
     def test_rule_versioning(self):
         """Test that all rules are properly versioned and tracked"""
         self.maxDiff = None
-        rules = RuleCollection.default()
+        rules = self.rc
         original_hashes = []
         post_bump_hashes = []
 
@@ -91,19 +98,20 @@ class TestRegistryPackage(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls) -> None:
-        from detection_rules.schemas.registry_package import RegistryPackageManifest
 
         assert 'registry_data' in package_configs, f'Missing registry_data in {PACKAGE_FILE}'
         cls.registry_config = package_configs['registry_data']
-        RegistryPackageManifest.from_dict(cls.registry_config)
+        stack_version = Version.parse(cls.registry_config['conditions']['kibana.version'].strip("^"),
+                                      optional_minor_and_patch=True)
+        if stack_version >= Version.parse("8.12.0"):
+            RegistryPackageManifestV3.from_dict(cls.registry_config)
+        else:
+            RegistryPackageManifestV1.from_dict(cls.registry_config)
 
     def test_registry_package_config(self):
         """Test that the registry package is validating properly."""
-        from marshmallow import ValidationError
-        from detection_rules.schemas.registry_package import RegistryPackageManifest
-
         registry_config = self.registry_config.copy()
         registry_config['version'] += '7.1.1.'
 
         with self.assertRaises(ValidationError):
-            RegistryPackageManifest.from_dict(registry_config)
+            RegistryPackageManifestV1.from_dict(registry_config)

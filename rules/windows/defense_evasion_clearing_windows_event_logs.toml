@@ -1,10 +1,10 @@
 [metadata]
 creation_date = "2020/02/18"
-integration = ["endpoint", "windows"]
+integration = ["endpoint", "windows", "system", "m365_defender", "sentinel_one_cloud_funnel", "crowdstrike"]
 maturity = "production"
-min_stack_comments = "New fields added: required_fields, related_integrations, setup"
-min_stack_version = "8.3.0"
-updated_date = "2023/06/22"
+updated_date = "2025/02/21"
+min_stack_version = "8.14.0"
+min_stack_comments = "Breaking change at 8.14.0 for the Windows Integration."
 
 [rule]
 author = ["Elastic"]
@@ -13,7 +13,17 @@ Identifies attempts to clear or disable Windows event log stores using Windows w
 attackers in an attempt to evade detection or destroy forensic evidence on a system.
 """
 from = "now-9m"
-index = ["winlogbeat-*", "logs-endpoint.events.*", "logs-windows.*", "endgame-*"]
+index = [
+    "endgame-*",
+    "logs-crowdstrike.fdr*",
+    "logs-endpoint.events.process-*",
+    "logs-m365_defender.event-*",
+    "logs-sentinel_one_cloud_funnel.*",
+    "logs-system.security*",
+    "logs-windows.forwarded*",
+    "logs-windows.sysmon_operational-*",
+    "winlogbeat-*",
+]
 language = "eql"
 license = "Elastic License v2"
 name = "Clearing Windows Event Logs"
@@ -48,11 +58,8 @@ This rule looks for the execution of the `wevtutil.exe` utility or the `Clear-Ev
 - Run a full antimalware scan. This may reveal additional artifacts left in the system, persistence mechanisms, and malware components.
 - Determine the initial vector abused by the attacker and take action to prevent reinfection through the same vector.
 - Using the incident response data, update logging and audit policies to improve the mean time to detect (MTTD) and the mean time to respond (MTTR).
-
-## Setup
-
-If enabling an EQL rule on a non-elastic-agent index (such as beats) for versions <8.2, events will not define `event.ingested` and default fallback for EQL rules was not added until 8.2, so you will need to add a custom pipeline to populate `event.ingested` to @timestamp for this rule to work.
 """
+references = ["https://www.elastic.co/security-labs/invisible-miners-unveiling-ghostengine"]
 risk_score = 21
 rule_id = "d331bbe2-6db4-4941-80a5-8270db72eb61"
 severity = "low"
@@ -63,6 +70,12 @@ tags = [
     "Tactic: Defense Evasion",
     "Resources: Investigation Guide",
     "Data Source: Elastic Endgame",
+    "Data Source: Elastic Defend",
+    "Data Source: Windows Security Event Logs",
+    "Data Source: Microsoft Defender for Endpoint",
+    "Data Source: Sysmon",
+    "Data Source: SentinelOne",
+    "Data Source: Crowdstrike",
 ]
 timestamp_override = "event.ingested"
 type = "eql"
@@ -71,11 +84,14 @@ query = '''
 process where host.os.type == "windows" and event.type == "start" and
 (
   (
-    (process.name : "wevtutil.exe" or process.pe.original_file_name == "wevtutil.exe") and
+    (process.name : "wevtutil.exe" or ?process.pe.original_file_name == "wevtutil.exe") and
     process.args : ("/e:false", "cl", "clear-log")
   ) or
   (
-    process.name : ("powershell.exe", "pwsh.exe", "powershell_ise.exe") and
+    (
+      process.name : ("powershell.exe", "pwsh.exe", "powershell_ise.exe") or
+      ?process.pe.original_file_name in ("powershell.exe", "pwsh.dll", "powershell_ise.exe")
+    ) and
     process.args : "Clear-EventLog"
   )
 )
@@ -92,6 +108,11 @@ reference = "https://attack.mitre.org/techniques/T1070/"
 id = "T1070.001"
 name = "Clear Windows Event Logs"
 reference = "https://attack.mitre.org/techniques/T1070/001/"
+
+[[rule.threat.technique.subtechnique]]
+id = "T1562.002"
+name = "Disable Windows Event Logging"
+reference = "https://attack.mitre.org/techniques/T1562/002/"
 
 
 

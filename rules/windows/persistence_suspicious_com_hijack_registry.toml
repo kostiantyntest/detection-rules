@@ -2,9 +2,7 @@
 creation_date = "2020/11/18"
 integration = ["endpoint"]
 maturity = "production"
-min_stack_comments = "New fields added: required_fields, related_integrations, setup"
-min_stack_version = "8.3.0"
-updated_date = "2023/06/22"
+updated_date = "2024/08/05"
 
 [rule]
 author = ["Elastic"]
@@ -13,7 +11,7 @@ Identifies Component Object Model (COM) hijacking via registry modification. Adv
 executing malicious content triggered by hijacked references to COM objects.
 """
 from = "now-9m"
-index = ["logs-endpoint.events.*", "endgame-*"]
+index = ["logs-endpoint.events.registry-*"]
 language = "eql"
 license = "Elastic License v2"
 name = "Component Object Model Hijacking"
@@ -57,64 +55,87 @@ Adversaries can insert malicious code that can be executed in place of legitimat
 - Run a full antimalware scan. This may reveal additional artifacts left in the system, persistence mechanisms, and malware components.
 - Determine the initial vector abused by the attacker and take action to prevent reinfection through the same vector.
 - Using the incident response data, update logging and audit policies to improve the mean time to detect (MTTD) and the mean time to respond (MTTR).
-
-
-## Setup
-
-If enabling an EQL rule on a non-elastic-agent index (such as beats) for versions <8.2, events will not define `event.ingested` and default fallback for EQL rules was not added until 8.2, so you will need to add a custom pipeline to populate `event.ingested` to @timestamp for this rule to work.
 """
 references = [
     "https://bohops.com/2018/08/18/abusing-the-com-registry-structure-part-2-loading-techniques-for-evasion-and-persistence/",
 ]
 risk_score = 47
 rule_id = "16a52c14-7883-47af-8745-9357803f0d4c"
+setup = """## Setup
+
+If enabling an EQL rule on a non-elastic-agent index (such as beats) for versions <8.2,
+events will not define `event.ingested` and default fallback for EQL rules was not added until version 8.2.
+Hence for this rule to work effectively, users will need to add a custom ingest pipeline to populate
+`event.ingested` to @timestamp.
+For more details on adding a custom ingest pipeline refer - https://www.elastic.co/guide/en/fleet/current/data-streams-pipeline-tutorial.html
+"""
 severity = "medium"
-tags = ["Domain: Endpoint", "OS: Windows", "Use Case: Threat Detection", "Tactic: Persistence", "Resources: Investigation Guide", "Data Source: Elastic Endgame"]
+tags = [
+    "Domain: Endpoint",
+    "OS: Windows",
+    "Use Case: Threat Detection",
+    "Tactic: Persistence",
+    "Tactic: Defense Evasion",
+    "Tactic: Privilege Escalation",
+    "Resources: Investigation Guide",
+    "Data Source: Elastic Endgame",
+    "Data Source: Elastic Defend",
+]
 timestamp_override = "event.ingested"
 type = "eql"
 
 query = '''
-registry where host.os.type == "windows" and
+registry where host.os.type == "windows" and event.type == "change" and
   /* not necessary but good for filtering privileged installations */
-  user.domain != "NT AUTHORITY" and
+  user.domain != "NT AUTHORITY" and process.executable != null and 
   (
     (
-      registry.path : ("HK*\\InprocServer32\\", "\\REGISTRY\\*\\InprocServer32\\") and
-      registry.data.strings: ("scrobj.dll", "C:\\*\\scrobj.dll") and
+      registry.path : "HK*\\InprocServer32\\" and
+      registry.data.strings: ("scrobj.dll", "?:\\*\\scrobj.dll") and
       not registry.path : "*\\{06290BD*-48AA-11D2-8432-006008C3FBFC}\\*"
     ) or
 
-    /* in general COM Registry changes on Users Hive is less noisy and worth alerting */
-    (registry.path : (
-        "HKEY_USERS\\*\\InprocServer32\\",
-        "HKEY_USERS\\*\\LocalServer32\\",
-        "HKEY_USERS\\*\\DelegateExecute*",
-        "HKEY_USERS\\*\\TreatAs*",
-        "HKEY_USERS\\*\\ScriptletURL*",
-        "\\REGISTRY\\USER\\*\\InprocServer32\\",
-        "\\REGISTRY\\USER\\*\\LocalServer32\\",
-        "\\REGISTRY\\USER\\*\\DelegateExecute*",
-        "\\REGISTRY\\USER\\*\\TreatAs*", 
-        "\\REGISTRY\\USER\\*\\ScriptletURL*"
-    ) and not 
     (
-      process.executable : "?:\\Program Files*\\Veeam\\Backup and Replication\\Console\\veeam.backup.shell.exe" and
-        registry.path : (
-          "HKEY_USERS\\S-1-*_Classes\\CLSID\\*\\LocalServer32\\",
-          "\\REGISTRY\\USER\\S-1-*_Classes\\CLSID\\*\\LocalServer32\\"))
+      registry.path : "HKLM\\*\\InProcServer32\\*" and
+        registry.data.strings : ("*\\Users\\*", "*\\ProgramData\\*")
     ) or
 
+    /* in general COM Registry changes on Users Hive is less noisy and worth alerting */
     (
-      registry.path : ("HKLM\\*\\InProcServer32\\*", "\\REGISTRY\\MACHINE\\*\\InProcServer32\\*") and
-        registry.data.strings : ("*\\Users\\*", "*\\ProgramData\\*")
+      registry.path : (
+        "HKEY_USERS\\*\\InprocServer32\\",
+        "HKEY_USERS\\*\\LocalServer32\\",
+        "HKEY_USERS\\*\\DelegateExecute",
+        "HKEY_USERS\\*\\TreatAs\\",
+        "HKEY_USERS\\*\\ScriptletURL*"
+      )  
     )
+  ) and 
+
+      not  (
+            process.code_signature.trusted == true and
+            process.code_signature.subject_name in 
+                         ("Island Technology Inc.", "Google LLC", "Grammarly, Inc.", "Dropbox, Inc", "REFINITIV US LLC", "HP Inc.",
+                          "Citrix Systems, Inc.", "Adobe Inc.", "Veeam Software Group GmbH", "Zhuhai Kingsoft Office Software Co., Ltd.",
+                          "Oracle America, Inc.")
+        ) and 
+
+  /* excludes Microsoft signed noisy processes */
+  not
+  (
+    process.name : ("OneDrive.exe", "OneDriveSetup.exe", "FileSyncConfig.exe", "Teams.exe", "MicrosoftEdgeUpdate.exe", "msrdcw.exe", "MicrosoftEdgeUpdateComRegisterShell64.exe") and
+    process.code_signature.trusted == true and process.code_signature.subject_name in ("Microsoft Windows", "Microsoft Corporation")
   ) and
-
-  /* removes false-positives generated by OneDrive and Teams */
-  not process.name: ("OneDrive.exe", "OneDriveSetup.exe", "FileSyncConfig.exe", "Teams.exe") and
-
-  /* Teams DLL loaded by regsvr */
-  not (process.name: "regsvr32.exe" and registry.data.strings : "*Microsoft.Teams.*.dll")
+  
+  not process.executable : 
+                  ("?:\\Program Files (x86)\\*.exe", 
+                   "?:\\Program Files\\*.exe",
+                   "?:\\Windows\\System32\\svchost.exe", 
+                   "?:\\Windows\\System32\\msiexec.exe", 
+                   "?:\\Windows\\SysWOW64\\regsvr32.exe",
+                   "?:\\Windows\\System32\\regsvr32.exe",
+                   "?:\\Windows\\System32\\DriverStore\\FileRepository\\*.exe", 
+                   "?:\\ProgramData\\Microsoft\\Windows Defender\\Platform\\*\\MsMpEng.exe")
 '''
 
 
@@ -135,4 +156,33 @@ reference = "https://attack.mitre.org/techniques/T1546/015/"
 id = "TA0003"
 name = "Persistence"
 reference = "https://attack.mitre.org/tactics/TA0003/"
+[[rule.threat]]
+framework = "MITRE ATT&CK"
+[[rule.threat.technique]]
+id = "T1546"
+name = "Event Triggered Execution"
+reference = "https://attack.mitre.org/techniques/T1546/"
+[[rule.threat.technique.subtechnique]]
+id = "T1546.015"
+name = "Component Object Model Hijacking"
+reference = "https://attack.mitre.org/techniques/T1546/015/"
+
+
+
+[rule.threat.tactic]
+id = "TA0004"
+name = "Privilege Escalation"
+reference = "https://attack.mitre.org/tactics/TA0004/"
+[[rule.threat]]
+framework = "MITRE ATT&CK"
+[[rule.threat.technique]]
+id = "T1112"
+name = "Modify Registry"
+reference = "https://attack.mitre.org/techniques/T1112/"
+
+
+[rule.threat.tactic]
+id = "TA0005"
+name = "Defense Evasion"
+reference = "https://attack.mitre.org/tactics/TA0005/"
 
