@@ -21,7 +21,7 @@ license = "Elastic License v2"
 name = "Suspicious File Downloaded from Google Drive"
 references = ["https://intelligence.abnormalsecurity.com/blog/google-drive-matanbuchus-malware"]
 risk_score = 47
-rule_id = "a8afdce2-0ec1-11ee-b843-f661ea17fbcd"
+rule_id = "a8afdce0-0ec1-11ee-b843-f661ea17fbcd"
 severity = "medium"
 tags = [
     "Domain: Endpoint",
